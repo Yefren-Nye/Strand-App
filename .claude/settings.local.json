@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx prisma:*)",
+      "Bash(npm run:*)",
+      "Bash(timeout 8 npx tsx server/index.ts)",
+      "Bash(npx tsc:*)",
+      "Bash(tasklist)",
+      "Bash(findstr \"node\")"
+    ]
+  }
+}
