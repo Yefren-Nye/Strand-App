@@ -196,6 +196,12 @@ function buildDirective(strand: Strand, profile: any, recentSessions: any[]): {
   };
 }
 
+// ── GET /health ───────────────────────────────────────────────────────────────
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // ── POST /sessions ────────────────────────────────────────────────────────────
 
 app.post('/sessions', (req, res) => {
