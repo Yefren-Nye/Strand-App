@@ -3,9 +3,9 @@ import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
-import { getDb } from '../lib/db';
-import { calculateBalance } from '../lib/balance';
-import { Strand, STRAND_META } from '../constants/strands';
+import { getDb } from './lib/db';
+import { calculateBalance } from './lib/balance';
+import { Strand, STRAND_META } from './constants/strands';
 
 const app = express();
 app.use(cors());
@@ -25,20 +25,28 @@ function daysAgoString(days: number): string {
   return d.toISOString().split('T')[0];
 }
 
-function weekStartString(): string {
+function weekStartDate(): Date {
   const d = new Date();
   const day = d.getDay(); // 0 = Sunday
   d.setDate(d.getDate() - day);
   d.setHours(0, 0, 0, 0);
-  return d.toISOString();
+  return d;
 }
 
-function getActiveProfile(userId: string): any | null {
+// Prisma returns DateTime as Date objects; SnoozeLike.snoozedUntil expects a string.
+function normaliseSnoozeLike(s: any) {
+  return {
+    ...s,
+    snoozedUntil: s.snoozedUntil instanceof Date ? s.snoozedUntil.toISOString() : s.snoozedUntil,
+  };
+}
+
+async function getActiveProfile(userId: string): Promise<any | null> {
   const db = getDb();
-  return db.prepare("SELECT * FROM Profile WHERE userId = ? AND isActive = 1 LIMIT 1").get(userId) ?? null;
+  return db.profile.findFirst({ where: { userId, isActive: true } });
 }
 
-function buildDirective(strand: Strand, profile: any, recentSessions: any[]): {
+async function buildDirective(strand: Strand, profile: any, recentSessions: any[]): Promise<{
   strand: Strand;
   activityType: string;
   instruction: string;
@@ -50,8 +58,7 @@ function buildDirective(strand: Strand, profile: any, recentSessions: any[]): {
     definition: string;
     promptSentence: string;
   };
-} {
-  const db = getDb();
+}> {
   const targetLang = profile?.targetLanguage || 'your target language';
 
   const lastForStrand = recentSessions.find((s) => s.strand === strand);
@@ -65,34 +72,40 @@ function buildDirective(strand: Strand, profile: any, recentSessions: any[]): {
   }
 
   if (strand === Strand.FORM) {
-    const profileId = profile?.id ?? '';
+    const db = getDb();
+    const profileId = profile?.id ?? null;
     const userId = profile?.userId ?? '';
-    const dueWord = db.prepare(`
-      SELECT uw.*, cw.word, cw.reading, cw.definition
-      FROM UserWord uw
-      JOIN CorpusWord cw ON cw.id = uw.corpusWordId
-      WHERE (uw.profileId = ? OR uw.userId = ?)
-        AND uw.nextReview <= datetime('now')
-      ORDER BY uw.nextReview ASC LIMIT 1
-    `).get(profileId, userId) as any;
 
-    const dueCount = (db.prepare(`
-      SELECT COUNT(*) as c FROM UserWord uw
-      WHERE (uw.profileId = ? OR uw.userId = ?) AND uw.nextReview <= datetime('now')
-    `).get(profileId, userId) as any)?.c ?? 0;
+    const orConditions: any[] = [{ userId }];
+    if (profileId) orConditions.unshift({ profileId });
+
+    const dueFilter = {
+      AND: [
+        { nextReview: { lte: new Date() } },
+        { OR: orConditions },
+      ],
+    };
+
+    const dueWord = await db.userWord.findFirst({
+      where: dueFilter,
+      orderBy: { nextReview: 'asc' },
+      include: { corpusWord: true },
+    });
+
+    const dueCount = await db.userWord.count({ where: dueFilter });
 
     if (dueWord && dueCount > 0) {
       return {
         strand,
         activityType: 'vocab-review',
-        instruction: `You have ${dueCount} word${dueCount > 1 ? 's' : ''} due for review. Start with "${dueWord.word}"${dueWord.reading ? ` (${dueWord.reading})` : ''} — ${dueWord.definition}.`,
-        contentReference: dueWord.word,
+        instruction: `You have ${dueCount} word${dueCount > 1 ? 's' : ''} due for review. Start with "${dueWord.corpusWord.word}"${dueWord.corpusWord.reading ? ` (${dueWord.corpusWord.reading})` : ''} — ${dueWord.corpusWord.definition}.`,
+        contentReference: dueWord.corpusWord.word,
         isInAppExercise: true,
         exercise: {
           type: 'sentence-production',
-          targetWord: dueWord.word,
-          definition: dueWord.definition,
-          promptSentence: `Use "${dueWord.word}" in a sentence that shows you understand its meaning.`,
+          targetWord: dueWord.corpusWord.word,
+          definition: dueWord.corpusWord.definition,
+          promptSentence: `Use "${dueWord.corpusWord.word}" in a sentence that shows you understand its meaning.`,
         },
       };
     }
@@ -204,7 +217,7 @@ app.get('/health', (_req, res) => {
 
 // ── POST /sessions ────────────────────────────────────────────────────────────
 
-app.post('/sessions', (req, res) => {
+app.post('/sessions', async (req, res) => {
   const { userId, strand, durationMinutes, activityType, notes, source, focusRating, loggedExternally } = req.body;
 
   if (!userId || !strand || !durationMinutes || !activityType) {
@@ -213,66 +226,87 @@ app.post('/sessions', (req, res) => {
   }
 
   const db = getDb();
-  const profile = getActiveProfile(userId);
+  const profile = await getActiveProfile(userId);
   const profileId = profile?.id ?? null;
   const id = randomUUID();
-  const createdAt = new Date().toISOString();
+  const createdAt = new Date();
 
-  db.prepare(`
-    INSERT INTO Session (id, userId, profileId, strand, durationMinutes, activityType, notes, source, focusRating, loggedExternally, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, userId, profileId, strand, durationMinutes, activityType, notes ?? null, source ?? null, focusRating ?? null, loggedExternally ? 1 : 0, createdAt);
+  const session = await db.session.create({
+    data: {
+      id,
+      userId,
+      profileId,
+      strand,
+      durationMinutes,
+      activityType,
+      notes: notes ?? null,
+      source: source ?? null,
+      focusRating: focusRating ?? null,
+      loggedExternally: loggedExternally ? true : false,
+      createdAt,
+    },
+  });
 
-  const session = db.prepare('SELECT * FROM Session WHERE id = ?').get(id) as any;
-
-  const todayStart = todayString() + 'T00:00:00.000Z';
-  const todaySessions = db.prepare(
-    'SELECT * FROM Session WHERE userId = ? AND createdAt >= ?'
-  ).all(userId, todayStart) as any[];
+  const todayStart = new Date(todayString() + 'T00:00:00.000Z');
+  const todaySessions = await db.session.findMany({
+    where: { userId, createdAt: { gte: todayStart } },
+  });
 
   const balance = calculateBalance(todaySessions);
 
-  db.prepare(`
-    INSERT INTO StrandBalance (id, userId, profileId, date, inputMinutes, outputMinutes, formMinutes, fluencyMinutes, balanceScore, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(userId, date) DO UPDATE SET
-      profileId = excluded.profileId,
-      inputMinutes = excluded.inputMinutes,
-      outputMinutes = excluded.outputMinutes,
-      formMinutes = excluded.formMinutes,
-      fluencyMinutes = excluded.fluencyMinutes,
-      balanceScore = excluded.balanceScore
-  `).run(
-    randomUUID(), userId, profileId, todayString(),
-    balance.minutesPerStrand[Strand.INPUT],
-    balance.minutesPerStrand[Strand.OUTPUT],
-    balance.minutesPerStrand[Strand.FORM],
-    balance.minutesPerStrand[Strand.FLUENCY],
-    balance.balanceScore,
-    createdAt
-  );
+  await db.strandBalance.upsert({
+    where: { userId_date: { userId, date: todayString() } },
+    update: {
+      profileId,
+      inputMinutes: balance.minutesPerStrand[Strand.INPUT],
+      outputMinutes: balance.minutesPerStrand[Strand.OUTPUT],
+      formMinutes: balance.minutesPerStrand[Strand.FORM],
+      fluencyMinutes: balance.minutesPerStrand[Strand.FLUENCY],
+      balanceScore: balance.balanceScore,
+    },
+    create: {
+      id: randomUUID(),
+      userId,
+      profileId,
+      date: todayString(),
+      inputMinutes: balance.minutesPerStrand[Strand.INPUT],
+      outputMinutes: balance.minutesPerStrand[Strand.OUTPUT],
+      formMinutes: balance.minutesPerStrand[Strand.FORM],
+      fluencyMinutes: balance.minutesPerStrand[Strand.FLUENCY],
+      balanceScore: balance.balanceScore,
+    },
+  });
 
   res.status(201).json(session);
 });
 
 // ── GET /sessions ─────────────────────────────────────────────────────────────
 
-app.get('/sessions', (req, res) => {
+app.get('/sessions', async (req, res) => {
   const days = parseInt((req.query.days as string) || '7', 10);
   const userId = (req.query.userId as string) || null;
-  const since = daysAgoString(days) + 'T00:00:00.000Z';
+  const since = new Date(daysAgoString(days) + 'T00:00:00.000Z');
   const db = getDb();
 
   let sessions: any[];
   if (userId) {
-    const profile = getActiveProfile(userId);
+    const profile = await getActiveProfile(userId);
     if (profile) {
-      sessions = db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(profile.id, since);
+      sessions = await db.session.findMany({
+        where: { profileId: profile.id, createdAt: { gte: since } },
+        orderBy: { createdAt: 'desc' },
+      });
     } else {
-      sessions = db.prepare('SELECT * FROM Session WHERE userId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(userId, since);
+      sessions = await db.session.findMany({
+        where: { userId, createdAt: { gte: since } },
+        orderBy: { createdAt: 'desc' },
+      });
     }
   } else {
-    sessions = db.prepare('SELECT * FROM Session WHERE createdAt >= ? ORDER BY createdAt DESC').all(since);
+    sessions = await db.session.findMany({
+      where: { createdAt: { gte: since } },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   res.json(sessions);
@@ -280,25 +314,33 @@ app.get('/sessions', (req, res) => {
 
 // ── GET /balance ──────────────────────────────────────────────────────────────
 
-app.get('/balance', (req, res) => {
+app.get('/balance', async (req, res) => {
   const userId = (req.query.userId as string) || 'seed-user-ay';
   const db = getDb();
-  const since = daysAgoString(7) + 'T00:00:00.000Z';
+  const since = new Date(daysAgoString(7) + 'T00:00:00.000Z');
 
-  const profile = getActiveProfile(userId);
+  const profile = await getActiveProfile(userId);
   const profileId = profile?.id ?? null;
 
   let sessions: any[];
   let snoozes: any[] = [];
 
   if (profileId) {
-    sessions = db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ? ORDER BY createdAt ASC').all(profileId, since);
-    snoozes = db.prepare('SELECT * FROM StrandSnooze WHERE profileId = ? AND weekStartDate >= ?').all(profileId, weekStartString());
+    sessions = await db.session.findMany({
+      where: { profileId, createdAt: { gte: since } },
+      orderBy: { createdAt: 'asc' },
+    });
+    snoozes = await db.strandSnooze.findMany({
+      where: { profileId, weekStartDate: { gte: weekStartDate() } },
+    });
   } else {
-    sessions = db.prepare('SELECT * FROM Session WHERE userId = ? AND createdAt >= ? ORDER BY createdAt ASC').all(userId, since);
+    sessions = await db.session.findMany({
+      where: { userId, createdAt: { gte: since } },
+      orderBy: { createdAt: 'asc' },
+    });
   }
 
-  const balance = calculateBalance(sessions, snoozes);
+  const balance = calculateBalance(sessions, snoozes.map(normaliseSnoozeLike));
 
   const daily: Record<string, { date: string; inputMinutes: number; outputMinutes: number; formMinutes: number; fluencyMinutes: number }> = {};
   for (let i = 6; i >= 0; i--) {
@@ -308,7 +350,7 @@ app.get('/balance', (req, res) => {
     daily[key] = { date: key, inputMinutes: 0, outputMinutes: 0, formMinutes: 0, fluencyMinutes: 0 };
   }
   for (const s of sessions) {
-    const dateKey = (s.createdAt as string).split('T')[0];
+    const dateKey = (s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt as string).split('T')[0];
     if (dateKey in daily) {
       const day = daily[dateKey];
       if (s.strand === Strand.INPUT) day.inputMinutes += s.durationMinutes;
@@ -318,10 +360,10 @@ app.get('/balance', (req, res) => {
     }
   }
 
-  const todayStart = todayString() + 'T00:00:00.000Z';
+  const todayStart = new Date(todayString() + 'T00:00:00.000Z');
   const todaySessions = profileId
-    ? db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(profileId, todayStart)
-    : db.prepare('SELECT * FROM Session WHERE userId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(userId, todayStart);
+    ? await db.session.findMany({ where: { profileId, createdAt: { gte: todayStart } }, orderBy: { createdAt: 'desc' } })
+    : await db.session.findMany({ where: { userId, createdAt: { gte: todayStart } }, orderBy: { createdAt: 'desc' } });
 
   res.json({ ...balance, daily: Object.values(daily), todaySessions, profileId, profile });
 });
@@ -331,25 +373,35 @@ app.get('/balance', (req, res) => {
 app.get('/practice', async (req, res) => {
   const userId = (req.query.userId as string) || 'seed-user-ay';
   const db = getDb();
-  const since14 = daysAgoString(14) + 'T00:00:00.000Z';
+  const since14 = new Date(daysAgoString(14) + 'T00:00:00.000Z');
 
-  const profile = getActiveProfile(userId);
+  const profile = await getActiveProfile(userId);
   const profileId = profile?.id ?? null;
 
   let sessions: any[];
   let snoozes: any[] = [];
 
   if (profileId) {
-    sessions = db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(profileId, since14);
-    snoozes = db.prepare('SELECT * FROM StrandSnooze WHERE profileId = ? AND weekStartDate >= ?').all(profileId, weekStartString());
+    sessions = await db.session.findMany({
+      where: { profileId, createdAt: { gte: since14 } },
+      orderBy: { createdAt: 'desc' },
+    });
+    snoozes = await db.strandSnooze.findMany({
+      where: { profileId, weekStartDate: { gte: weekStartDate() } },
+    });
   } else {
-    sessions = db.prepare('SELECT * FROM Session WHERE userId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(userId, since14);
+    sessions = await db.session.findMany({
+      where: { userId, createdAt: { gte: since14 } },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
-  const balance = calculateBalance(sessions, snoozes);
+  const balance = calculateBalance(sessions, snoozes.map(normaliseSnoozeLike));
   const weakest = balance.weakestStrand;
 
-  const allDirectives = Object.values(Strand).map((s) => buildDirective(s as Strand, profile, sessions));
+  const allDirectives = await Promise.all(
+    Object.values(Strand).map((s) => buildDirective(s as Strand, profile, sessions))
+  );
   const primaryDirective = allDirectives.find((d) => d.strand === weakest)!;
 
   let suggestedResource: { title: string; url: string; reason: string } | null = null;
@@ -403,31 +455,53 @@ app.post('/practice/snooze', async (req, res) => {
   if (!strand) { res.status(400).json({ error: 'strand is required' }); return; }
 
   const db = getDb();
-  const profile = getActiveProfile(userId);
+  const profile = await getActiveProfile(userId);
   const profileId = profile?.id;
   if (!profileId) { res.status(404).json({ error: 'No active profile found' }); return; }
 
   const now = new Date();
-  const snoozedUntil = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
-  const weekStart = weekStartString();
+  const snoozedUntil = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+  const weekStart = weekStartDate();
 
-  const existing = db.prepare(
-    "SELECT * FROM StrandSnooze WHERE profileId = ? AND strand = ? AND weekStartDate = ? ORDER BY snoozeCountThisWeek DESC LIMIT 1"
-  ).get(profileId, strand, weekStart) as any;
+  const existing = await db.strandSnooze.findFirst({
+    where: { profileId, strand, weekStartDate: weekStart },
+    orderBy: { snoozeCountThisWeek: 'desc' },
+  });
 
   const newCount = (existing?.snoozeCountThisWeek ?? 0) + 1;
 
-  db.prepare(`INSERT INTO StrandSnooze (id, profileId, strand, snoozedUntil, snoozeCountThisWeek, weekStartDate, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(randomUUID(), profileId, strand, snoozedUntil, newCount, weekStart, now.toISOString());
+  await db.strandSnooze.create({
+    data: {
+      id: randomUUID(),
+      profileId,
+      strand,
+      snoozedUntil,
+      snoozeCountThisWeek: newCount,
+      weekStartDate: weekStart,
+    },
+  });
 
-  db.prepare(`INSERT INTO AvoidanceEvent (id, profileId, strand, reason, createdAt) VALUES (?, ?, ?, ?, ?)`)
-    .run(randomUUID(), profileId, strand, reason ?? null, now.toISOString());
+  await db.avoidanceEvent.create({
+    data: {
+      id: randomUUID(),
+      profileId,
+      strand,
+      reason: reason ?? null,
+    },
+  });
 
-  const since14 = daysAgoString(14) + 'T00:00:00.000Z';
-  const sessions = db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ? ORDER BY createdAt DESC').all(profileId, since14) as any[];
-  const snoozes = db.prepare('SELECT * FROM StrandSnooze WHERE profileId = ? AND weekStartDate >= ?').all(profileId, weekStart) as any[];
-  const balance = calculateBalance(sessions, snoozes);
-  const allDirectives = Object.values(Strand).map((s) => buildDirective(s as Strand, profile, sessions));
+  const since14 = new Date(daysAgoString(14) + 'T00:00:00.000Z');
+  const sessions = await db.session.findMany({
+    where: { profileId, createdAt: { gte: since14 } },
+    orderBy: { createdAt: 'desc' },
+  });
+  const snoozes = await db.strandSnooze.findMany({
+    where: { profileId, weekStartDate: { gte: weekStart } },
+  });
+  const balance = calculateBalance(sessions, snoozes.map(normaliseSnoozeLike));
+  const allDirectives = await Promise.all(
+    Object.values(Strand).map((s) => buildDirective(s as Strand, profile, sessions))
+  );
   const primaryDirective = allDirectives.find((d) => d.strand === balance.weakestStrand)!;
 
   res.json({ ...primaryDirective, suggestedResource: null, avoidanceLevel: balance.avoidanceLevel, pressureMessage: balance.pressureMessage, allSnoozed: balance.allSnoozed, allDirectives });
@@ -435,34 +509,54 @@ app.post('/practice/snooze', async (req, res) => {
 
 // ── POST /practice/complete ───────────────────────────────────────────────────
 
-app.post('/practice/complete', (req, res) => {
+app.post('/practice/complete', async (req, res) => {
   const { userId = 'seed-user-ay', strand, durationMinutes, focusRating, exerciseResult } = req.body;
   if (!strand || !durationMinutes) { res.status(400).json({ error: 'strand and durationMinutes are required' }); return; }
 
   const db = getDb();
-  const profile = getActiveProfile(userId);
+  const profile = await getActiveProfile(userId);
   const profileId = profile?.id ?? null;
   const id = randomUUID();
-  const createdAt = new Date().toISOString();
+  const createdAt = new Date();
 
-  db.prepare(`INSERT INTO Session (id, userId, profileId, strand, durationMinutes, activityType, focusRating, loggedExternally, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`)
-    .run(id, userId, profileId, strand, durationMinutes, 'practice', focusRating ?? null, createdAt);
+  await db.session.create({
+    data: {
+      id,
+      userId,
+      profileId,
+      strand,
+      durationMinutes,
+      activityType: 'practice',
+      focusRating: focusRating ?? null,
+      loggedExternally: false,
+      createdAt,
+    },
+  });
 
   if (exerciseResult?.wordId) {
-    const word = db.prepare('SELECT * FROM UserWord WHERE id = ?').get(exerciseResult.wordId) as any;
+    const word = await db.userWord.findUnique({ where: { id: exerciseResult.wordId } });
     if (word) {
       const ef = exerciseResult.correct ? Math.min(4.0, word.easeFactor + 0.1) : Math.max(1.3, word.easeFactor - 0.2);
       const iv = exerciseResult.correct ? Math.max(1, Math.round(word.interval * ef)) : 1;
-      const nr = new Date(Date.now() + iv * 24 * 60 * 60 * 1000).toISOString();
-      db.prepare(`UPDATE UserWord SET easeFactor = ?, interval = ?, nextReview = ?, status = 'LEARNING', encounters = encounters + 1, lastEncountered = ? WHERE id = ?`)
-        .run(ef, iv, nr, createdAt, exerciseResult.wordId);
+      const nr = new Date(Date.now() + iv * 24 * 60 * 60 * 1000);
+      await db.userWord.update({
+        where: { id: exerciseResult.wordId },
+        data: {
+          easeFactor: ef,
+          interval: iv,
+          nextReview: nr,
+          status: 'LEARNING',
+          encounters: { increment: 1 },
+          lastEncountered: createdAt,
+        },
+      });
     }
   }
 
-  const since = daysAgoString(7) + 'T00:00:00.000Z';
+  const since = new Date(daysAgoString(7) + 'T00:00:00.000Z');
   const sessions = profileId
-    ? db.prepare('SELECT * FROM Session WHERE profileId = ? AND createdAt >= ?').all(profileId, since) as any[]
-    : db.prepare('SELECT * FROM Session WHERE userId = ? AND createdAt >= ?').all(userId, since) as any[];
+    ? await db.session.findMany({ where: { profileId, createdAt: { gte: since } } })
+    : await db.session.findMany({ where: { userId, createdAt: { gte: since } } });
   const balance = calculateBalance(sessions);
 
   res.json({ balance, sessionId: id });
@@ -529,15 +623,15 @@ app.post('/practice/avoidance-help', async (req, res) => {
 
 // ── GET /profiles ─────────────────────────────────────────────────────────────
 
-app.get('/profiles', (req, res) => {
+app.get('/profiles', async (req, res) => {
   const userId = (req.query.userId as string) || 'seed-user-ay';
   const db = getDb();
-  res.json(db.prepare('SELECT * FROM Profile WHERE userId = ? ORDER BY createdAt ASC').all(userId));
+  res.json(await db.profile.findMany({ where: { userId }, orderBy: { createdAt: 'asc' } }));
 });
 
 // ── POST /profiles ────────────────────────────────────────────────────────────
 
-app.post('/profiles', (req, res) => {
+app.post('/profiles', async (req, res) => {
   const { userId = 'seed-user-ay', targetLanguage, nativeLanguage, level } = req.body;
   if (!targetLanguage || !nativeLanguage || !level) {
     res.status(400).json({ error: 'targetLanguage, nativeLanguage, and level are required' });
@@ -545,62 +639,75 @@ app.post('/profiles', (req, res) => {
   }
 
   const db = getDb();
-  const id = randomUUID();
-  const createdAt = new Date().toISOString();
-  db.prepare(`INSERT INTO Profile (id, userId, targetLanguage, nativeLanguage, level, isActive, createdAt) VALUES (?, ?, ?, ?, ?, 0, ?)`)
-    .run(id, userId, targetLanguage, nativeLanguage, level, createdAt);
-
-  res.status(201).json(db.prepare('SELECT * FROM Profile WHERE id = ?').get(id));
+  const profile = await db.profile.create({
+    data: {
+      id: randomUUID(),
+      userId,
+      targetLanguage,
+      nativeLanguage,
+      level,
+      isActive: false,
+    },
+  });
+  res.status(201).json(profile);
 });
 
 // ── PATCH /profiles/:id/activate ─────────────────────────────────────────────
 
-app.patch('/profiles/:id/activate', (req, res) => {
+app.patch('/profiles/:id/activate', async (req, res) => {
   const { id } = req.params;
   const userId = (req.body.userId as string) || 'seed-user-ay';
   const db = getDb();
 
-  db.prepare('UPDATE Profile SET isActive = 0 WHERE userId = ?').run(userId);
-  db.prepare('UPDATE Profile SET isActive = 1 WHERE id = ? AND userId = ?').run(id, userId);
-
-  const profile = db.prepare('SELECT * FROM Profile WHERE id = ?').get(id);
-  if (!profile) { res.status(404).json({ error: 'Profile not found' }); return; }
-  res.json(profile);
+  await db.profile.updateMany({ where: { userId }, data: { isActive: false } });
+  try {
+    const profile = await db.profile.update({ where: { id }, data: { isActive: true } });
+    res.json(profile);
+  } catch {
+    res.status(404).json({ error: 'Profile not found' });
+  }
 });
 
 // ── GET /words/due ────────────────────────────────────────────────────────────
 
-app.get('/words/due', (req, res) => {
+app.get('/words/due', async (req, res) => {
   const db = getDb();
-  res.json(db.prepare(`
-    SELECT uw.*, cw.word, cw.reading, cw.definition, cw.language, cw.frequencyRank, cw.level as corpusLevel
-    FROM UserWord uw JOIN CorpusWord cw ON cw.id = uw.corpusWordId
-    WHERE uw.nextReview <= datetime('now')
-    ORDER BY uw.nextReview ASC LIMIT 20
-  `).all());
+  const words = await db.userWord.findMany({
+    where: { nextReview: { lte: new Date() } },
+    orderBy: { nextReview: 'asc' },
+    take: 20,
+    include: { corpusWord: true },
+  });
+  res.json(words.map((w) => ({
+    ...w,
+    word: w.corpusWord.word,
+    reading: w.corpusWord.reading,
+    definition: w.corpusWord.definition,
+    language: w.corpusWord.language,
+    frequencyRank: w.corpusWord.frequencyRank,
+    corpusLevel: w.corpusWord.level,
+  })));
 });
 
 // ── PATCH /words/:id ──────────────────────────────────────────────────────────
 
-app.patch('/words/:id', (req, res) => {
+app.patch('/words/:id', async (req, res) => {
   const { id } = req.params;
   const { easeFactor, interval, nextReview, status, encounters, lastEncountered } = req.body;
   const db = getDb();
-  const updates: string[] = [];
-  const values: any[] = [];
 
-  if (easeFactor !== undefined) { updates.push('easeFactor = ?'); values.push(easeFactor); }
-  if (interval !== undefined) { updates.push('interval = ?'); values.push(interval); }
-  if (nextReview !== undefined) { updates.push('nextReview = ?'); values.push(nextReview); }
-  if (status !== undefined) { updates.push('status = ?'); values.push(status); }
-  if (encounters !== undefined) { updates.push('encounters = ?'); values.push(encounters); }
-  if (lastEncountered !== undefined) { updates.push('lastEncountered = ?'); values.push(lastEncountered); }
+  const data: any = {};
+  if (easeFactor !== undefined) data.easeFactor = easeFactor;
+  if (interval !== undefined) data.interval = interval;
+  if (nextReview !== undefined) data.nextReview = new Date(nextReview);
+  if (status !== undefined) data.status = status;
+  if (encounters !== undefined) data.encounters = encounters;
+  if (lastEncountered !== undefined) data.lastEncountered = new Date(lastEncountered);
 
-  if (updates.length === 0) { res.status(400).json({ error: 'No fields to update' }); return; }
+  if (Object.keys(data).length === 0) { res.status(400).json({ error: 'No fields to update' }); return; }
 
-  values.push(id);
-  db.prepare(`UPDATE UserWord SET ${updates.join(', ')} WHERE id = ?`).run(...values);
-  res.json(db.prepare('SELECT * FROM UserWord WHERE id = ?').get(id));
+  const word = await db.userWord.update({ where: { id }, data });
+  res.json(word);
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
