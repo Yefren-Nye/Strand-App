@@ -9,6 +9,7 @@
     "db:generate": "npx prisma generate"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
     "@prisma/client": "^5.22.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
