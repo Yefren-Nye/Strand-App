@@ -7,7 +7,8 @@
       "Bash(timeout 8 npx tsx server/index.ts)",
       "Bash(npx tsc:*)",
       "Bash(tasklist)",
-      "Bash(findstr \"node\")"
+      "Bash(findstr \"node\")",
+      "Bash(timeout 8 npx tsx index.ts)"
     ]
   }
 }
