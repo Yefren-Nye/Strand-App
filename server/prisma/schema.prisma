@@ -1,0 +1,132 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// StrandType values: INPUT | OUTPUT | FORM | FLUENCY
+// WordStatus values: UNSEEN | ENCOUNTERED | LEARNING | KNOWN
+
+model User {
+  id                      String   @id @default(cuid())
+  name                    String
+  targetLanguage          String
+  nativeLanguage          String
+  level                   String
+  hardcoreMode            Boolean  @default(false)
+  hardcoreIntervalMinutes Int      @default(20)
+  createdAt               DateTime @default(now())
+
+  sessions       Session[]
+  userWords      UserWord[]
+  strandBalances StrandBalance[]
+  profiles       Profile[]
+}
+
+model Profile {
+  id             String   @id @default(cuid())
+  userId         String
+  targetLanguage String
+  nativeLanguage String
+  level          String
+  isActive       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  user            User             @relation(fields: [userId], references: [id])
+  sessions        Session[]
+  userWords       UserWord[]
+  strandBalances  StrandBalance[]
+  snoozes         StrandSnooze[]
+  avoidanceEvents AvoidanceEvent[]
+}
+
+model StrandSnooze {
+  id                  String   @id @default(cuid())
+  profileId           String
+  strand              String
+  snoozedUntil        DateTime
+  snoozeCountThisWeek Int      @default(0)
+  weekStartDate       DateTime
+  createdAt           DateTime @default(now())
+
+  profile Profile @relation(fields: [profileId], references: [id])
+}
+
+model AvoidanceEvent {
+  id        String   @id @default(cuid())
+  profileId String
+  strand    String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  profile Profile @relation(fields: [profileId], references: [id])
+}
+
+model Session {
+  id               String   @id @default(cuid())
+  userId           String
+  profileId        String?
+  strand           String
+  durationMinutes  Int
+  activityType     String
+  notes            String?
+  source           String?
+  focusRating      Int?
+  loggedExternally Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id])
+  profile Profile? @relation(fields: [profileId], references: [id])
+}
+
+model CorpusWord {
+  id            String   @id @default(cuid())
+  language      String
+  word          String
+  reading       String?
+  definition    String
+  frequencyRank Int
+  level         String?
+  createdAt     DateTime @default(now())
+
+  userWords UserWord[]
+}
+
+model UserWord {
+  id              String    @id @default(cuid())
+  userId          String
+  profileId       String?
+  corpusWordId    String
+  status          String    @default("UNSEEN")
+  encounters      Int       @default(0)
+  lastEncountered DateTime?
+  easeFactor      Float     @default(2.5)
+  interval        Int       @default(1)
+  nextReview      DateTime?
+  createdAt       DateTime  @default(now())
+
+  user       User       @relation(fields: [userId], references: [id])
+  profile    Profile?   @relation(fields: [profileId], references: [id])
+  corpusWord CorpusWord @relation(fields: [corpusWordId], references: [id])
+}
+
+model StrandBalance {
+  id             String   @id @default(cuid())
+  userId         String
+  profileId      String?
+  date           String
+  inputMinutes   Int      @default(0)
+  outputMinutes  Int      @default(0)
+  formMinutes    Int      @default(0)
+  fluencyMinutes Int      @default(0)
+  balanceScore   Float    @default(0)
+  createdAt      DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id])
+  profile Profile? @relation(fields: [profileId], references: [id])
+
+  @@unique([userId, date])
+}

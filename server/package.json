@@ -1,0 +1,22 @@
+{
+  "name": "strand-server",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "npx tsx index.ts",
+    "dev": "nodemon --exec npx tsx index.ts",
+    "db:migrate": "npx prisma migrate deploy",
+    "db:seed": "npx tsx prisma/seed.ts",
+    "db:generate": "npx prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "prisma": "^5.22.0",
+    "tsx": "^4.21.0"
+  }
+}
