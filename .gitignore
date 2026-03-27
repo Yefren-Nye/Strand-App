@@ -147,3 +147,4 @@ vite.config.ts.timestamp-*
 *.db
 *.db-journal
 /generated/prisma
+database.url.txt
